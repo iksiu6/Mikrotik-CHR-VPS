@@ -90,8 +90,16 @@ main() {
     fi
 
     # --- 5. Download image (into RAM so dd doesn't read a file it overwrites)
+    # The image MUST be in RAM: a file on the disk would be overwritten while dd reads it.
     WORK=/dev/shm/chr
-    [ -d /dev/shm ] && [ "$(df -Pm /dev/shm | awk 'NR==2{print $4}')" -gt 400 ] || WORK=/tmp/chr
+    if [ ! -d /dev/shm ] || [ "$(df -Pm /dev/shm | awk 'NR==2{print $4}')" -lt 300 ]; then
+        mkdir -p /mnt/chr-ram && mount -t tmpfs -o size=320m tmpfs /mnt/chr-ram \
+            || die "cannot create RAM disk for the image"
+        WORK=/mnt/chr-ram/chr
+    fi
+    MEM_AVAIL="$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)"
+    [ -z "$MEM_AVAIL" ] || [ "$MEM_AVAIL" -ge 300 ] \
+        || die "not enough free RAM (${MEM_AVAIL} MB, need ~300 MB) - stop other services first"
     rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK"
 
     URL="https://download.mikrotik.com/routeros/$CHR_VERSION/chr-$CHR_VERSION.img.zip"
@@ -153,6 +161,7 @@ EOF
     "${RUN[@]}" "$RAMBIN/dd" --version >/dev/null 2>&1 || die "cannot run dd from RAM"
 
     swapoff -a 2>/dev/null || true      # RAM pages must not be swapped to the disk
+    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true   # free RAM before the last stage
     echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
     sync
 
