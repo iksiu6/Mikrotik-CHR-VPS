@@ -1,38 +1,39 @@
-# Mikrotik-CHR---VPS-Nazwa.pl
+# Mikrotik-CHR-VPS
 
-Works with Ubuntu 16.04 on VPS on Nazwa.pl
+Instalacja **najnowszej wersji stable MikroTik RouterOS CHR (v7)** na VPS – jednym poleceniem.
+Działa na VPS Nazwa.pl z Ubuntu 16.04 (i nowszych).
 
-## 1. Download script to Your machine using this command:
-```
-wget https://raw.githubusercontent.com/iksiu6/Mikrotik-CHR---VPS-Nazwa.pl/main/script.sh
-```
+> ⚠️ Skrypt **kasuje cały dysk VPS** i nadpisuje go obrazem CHR.
 
-## 2. Check Your network adapter using 
-```
-ifconfig -a
-```
-Should be "enp1s0" if is different use
-```
-nano script.sh 
-```
-and change it
-
-## 3. Check name of Your disk device
-
-Should be "sda" if is different use
-```
-nano script.sh 
-```
-and change it
-
-
-## 4. Use this command to install:
+## Instalacja (jedna komenda)
 
 ```
-sh script.sh
+wget -qO- https://raw.githubusercontent.com/iksiu6/Mikrotik-CHR-VPS/main/script.sh | sudo CHR_PASSWORD='TwojeHaslo' bash
 ```
 
-## 5. Try login using winbox
-login: admin
+Skrypt sam:
+- sprawdza na serwerach MikroTika, która wersja jest najnowsza w kanale stable i ją pobiera,
+- wykrywa interfejs sieciowy, adres IP, bramę i dysk (nie trzeba nic edytować w `nano`),
+- ustawia IP, bramę, DNS, wyłącza telnet/ftp/api i ustawia użytkownika `root` z Twoim hasłem,
+- wypisuje dane logowania, czeka 10 s (Ctrl+C przerywa), zapisuje dysk i restartuje.
 
-password: empty
+Jeśli nie podasz `CHR_PASSWORD`, hasło zostanie wygenerowane i wyświetlone na ekranie – **zapisz je**.
+
+## Opcje
+
+Zmienne wstawiasz przed `bash`, np. `sudo CHR_PASSWORD='x' CHR_DISK=/dev/sda bash`
+
+| Zmienna | Domyślnie | Opis |
+|---|---|---|
+| `CHR_PASSWORD` | losowe | hasło użytkownika |
+| `CHR_USER` | `root` | login |
+| `CHR_CHANNEL` | `stable` | `stable`, `long-term` lub `testing` |
+| `CHR_VERSION` | najnowsza | wymuszenie konkretnej wersji, np. `7.24.4` |
+| `CHR_IFACE` | auto | interfejs sieciowy, np. `enp1s0` |
+| `CHR_DISK` | auto | dysk docelowy, np. `/dev/vda` |
+| `CHR_YES` | – | `1` = bez 10-sekundowego odliczania |
+
+## Po instalacji
+
+Zaloguj się przez WinBox lub SSH na adres IP VPS-a, login `root` i hasło z instalacji.
+Zalecane: od razu ustaw firewall i wyłącz niepotrzebne usługi.

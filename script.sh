@@ -1,28 +1,150 @@
 #!/bin/bash
-wget https://download.mikrotik.com/routeros/6.49.2/chr-6.49.2.img.zip -O chr.img.zip  && \
-gunzip -c chr.img.zip > chr.img  && \
-mount -o loop,offset=512 chr.img /mnt && \
+#
+# MikroTik CHR installer for VPS (written for Nazwa.pl, Ubuntu 16.04+)
+# Installs the newest RouterOS v7 *stable* CHR image over the VPS disk.
+#
+# One-line install:
+#   wget -qO- https://raw.githubusercontent.com/iksiu6/Mikrotik-CHR-VPS/main/script.sh | sudo bash
+#
+# Optional variables (put them before "bash"):
+#   CHR_PASSWORD=haslo   password for user "root" (random one is generated if empty)
+#   CHR_USER=root        login name (default: root)
+#   CHR_VERSION=7.24.4   force a specific version instead of newest stable
+#   CHR_CHANNEL=stable   stable | long-term | testing
+#   CHR_IFACE=enp1s0     network interface (auto-detected)
+#   CHR_DISK=/dev/vda    target disk (auto-detected)
+#   CHR_YES=1            don't wait 10 s before wiping the disk
+#
+# Example:
+#   wget -qO- https://raw.githubusercontent.com/iksiu6/Mikrotik-CHR-VPS/main/script.sh | sudo CHR_PASSWORD='MojeHaslo' bash
+#
+# WARNING: this ERASES the whole disk of the VPS!
 
-#Check network adapter name in next line
-ADDRESS=`ip addr show eth0 | grep global | cut -d' ' -f 6 | head -n 1` && \
-#Check network adapter name line before
+# Everything is inside main() so bash reads the whole script before running it
+# (important when the script is piped from wget/curl).
+main() {
+    set -euo pipefail
 
-GATEWAY=`ip route list | grep default | cut -d' ' -f 3` && \
-echo "/ip address add address=$ADDRESS interface=[/interface ethernet find where name=ether1]
+    CHR_USER="${CHR_USER:-root}"
+    CHR_CHANNEL="${CHR_CHANNEL:-stable}"
+
+    die() { echo "ERROR: $*" >&2; exit 1; }
+
+    [ "$(id -u)" -eq 0 ] || die "run as root (sudo bash)"
+    for c in ip awk dd mount umount lsblk; do
+        command -v "$c" >/dev/null 2>&1 || die "missing command: $c"
+    done
+    command -v unzip >/dev/null 2>&1 || command -v gunzip >/dev/null 2>&1 || die "unzip or gunzip is required"
+
+    fetch() { # fetch URL [output]
+        if command -v wget >/dev/null 2>&1; then
+            if [ -n "${2:-}" ]; then wget -q --show-progress -O "$2" "$1" || wget -O "$2" "$1"
+            else wget -qO- "$1"; fi
+        elif command -v curl >/dev/null 2>&1; then
+            if [ -n "${2:-}" ]; then curl -fL -o "$2" "$1"; else curl -fsSL "$1"; fi
+        else
+            die "wget or curl is required"
+        fi
+    }
+
+    # --- 1. Newest version -------------------------------------------------
+    if [ -z "${CHR_VERSION:-}" ]; then
+        case "$CHR_CHANNEL" in
+            stable)    f=NEWESTa7.stable ;;
+            long-term) f=NEWESTa7.long-term ;;
+            testing)   f=NEWESTa7.testing ;;
+            *) die "unknown CHR_CHANNEL: $CHR_CHANNEL" ;;
+        esac
+        CHR_VERSION="$(fetch "https://upgrade.mikrotik.com/routeros/$f" | awk '{print $1}')"
+    fi
+    echo "$CHR_VERSION" | grep -Eq '^[0-9]+\.[0-9]+' || die "could not determine RouterOS version (got: '$CHR_VERSION')"
+    echo ">>> RouterOS CHR version: $CHR_VERSION ($CHR_CHANNEL)"
+
+    # --- 2. Network (auto-detect) ------------------------------------------
+    CHR_IFACE="${CHR_IFACE:-$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}"
+    [ -n "$CHR_IFACE" ] || die "could not detect network interface, set CHR_IFACE"
+    ADDRESS="$(ip -4 addr show dev "$CHR_IFACE" scope global | awk '/inet /{print $2; exit}')"
+    GATEWAY="$(ip -4 route show default | awk '{print $3; exit}')"
+    [ -n "$ADDRESS" ] || die "no IPv4 address on $CHR_IFACE"
+    [ -n "$GATEWAY" ] || die "no default gateway"
+    echo ">>> Interface: $CHR_IFACE  Address: $ADDRESS  Gateway: $GATEWAY"
+
+    # --- 3. Target disk (auto-detect) --------------------------------------
+    if [ -z "${CHR_DISK:-}" ]; then
+        ROOTDEV="$(findmnt -n -o SOURCE / 2>/dev/null || awk '$2=="/"{print $1}' /proc/mounts | tail -n1)"
+        # walk up from the root filesystem (partition / LVM / RAID) to the physical disk
+        PK="$(lsblk -rnso NAME,TYPE "$ROOTDEV" 2>/dev/null | awk '$2=="disk"{print $1; exit}' || true)"
+        if [ -n "$PK" ]; then
+            CHR_DISK="/dev/$PK"
+        else
+            for d in /dev/vda /dev/sda /dev/xvda /dev/nvme0n1; do [ -b "$d" ] && { CHR_DISK="$d"; break; }; done
+        fi
+    fi
+    [ -b "${CHR_DISK:-}" ] || die "could not detect target disk, set CHR_DISK"
+    echo ">>> Target disk: $CHR_DISK"
+
+    # --- 4. Password -------------------------------------------------------
+    if [ -z "${CHR_PASSWORD:-}" ]; then
+        CHR_PASSWORD="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16 || true)"
+        GENERATED=1
+    fi
+
+    # --- 5. Download image (into RAM so dd doesn't read a file it overwrites)
+    WORK=/dev/shm/chr
+    [ -d /dev/shm ] && [ "$(df -Pm /dev/shm | awk 'NR==2{print $4}')" -gt 400 ] || WORK=/tmp/chr
+    rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK"
+
+    URL="https://download.mikrotik.com/routeros/$CHR_VERSION/chr-$CHR_VERSION.img.zip"
+    echo ">>> Downloading $URL"
+    fetch "$URL" chr.img.zip || die "download failed"
+    if command -v unzip >/dev/null 2>&1; then unzip -p chr.img.zip > chr.img
+    else gunzip -c chr.img.zip > chr.img; fi
+    rm -f chr.img.zip
+    [ -s chr.img ] || die "image is empty"
+
+    # --- 6. Write autorun.scr into the image -------------------------------
+    # v7 images have 2 partitions, RouterOS data is on the 2nd one.
+    START="$(fdisk -l chr.img 2>/dev/null | awk '/^chr\.img2/{ s=$2; if(s=="*") s=$3; print s; exit}' || true)"
+    [ -n "$START" ] || START="$(sfdisk -d chr.img 2>/dev/null | awk -F'[=,]' '/^chr\.img2/{gsub(/ /,"",$2); print $2; exit}' || true)"
+    if [ -n "$START" ]; then OFFSET=$((START * 512)); else OFFSET=33571840; fi
+    MNT="$WORK/mnt"; mkdir -p "$MNT"
+    mount -o loop,offset="$OFFSET" chr.img "$MNT" || mount -o loop,offset=512 chr.img "$MNT" \
+        || die "cannot mount CHR image"
+    mkdir -p "$MNT/rw"
+    cat > "$MNT/rw/autorun.scr" <<EOF
+/ip address add address=$ADDRESS interface=[/interface ethernet find where name=ether1]
 /ip route add gateway=$GATEWAY
-/ip service disable telnet
-/user set 0 name=root password=xxxxxx
- " > /mnt/rw/autorun.scr && \
-umount /mnt && \
-echo u > /proc/sysrq-trigger && \
+/ip dns set servers=1.1.1.1,8.8.8.8
+/ip service disable telnet,ftp,api,api-ssl
+/user set 0 name=$CHR_USER password="$CHR_PASSWORD"
+EOF
+    umount "$MNT"
 
-#Check drive name in next line
-dd if=chr.img bs=1024 of=/dev/vda && \
-#Check drive name in line before
+    # --- 7. Summary + last chance -----------------------------------------
+    echo
+    echo "=========================================================="
+    echo "  RouterOS CHR $CHR_VERSION will be written to $CHR_DISK"
+    echo "  After reboot log in with WinBox / SSH:"
+    echo "    address : ${ADDRESS%/*}"
+    echo "    login   : $CHR_USER"
+    echo "    password: $CHR_PASSWORD"
+    [ -n "${GENERATED:-}" ] && echo "  (password was generated - WRITE IT DOWN NOW!)"
+    echo "=========================================================="
+    if [ -z "${CHR_YES:-}" ]; then
+        echo "Wiping $CHR_DISK in 10 s... press Ctrl+C to abort"
+        sleep 10
+    fi
 
-echo "sync disk" && \
-echo s > /proc/sysrq-trigger && \
-echo "Sleep 5 seconds" && \
-sleep 5 && \
-echo "Ok, reboot" && \
-echo b > /proc/sysrq-trigger
+    # --- 8. Write and reboot ----------------------------------------------
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
+    sync
+    echo u > /proc/sysrq-trigger          # remount filesystems read-only
+    dd if=chr.img of="$CHR_DISK" bs=4M conv=fsync 2>/dev/null || dd if=chr.img of="$CHR_DISK" bs=1024
+    echo ">>> Sync disk"
+    echo s > /proc/sysrq-trigger
+    sleep 5
+    echo ">>> Reboot"
+    echo b > /proc/sysrq-trigger
+}
+
+main "$@"
