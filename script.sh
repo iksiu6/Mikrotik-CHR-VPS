@@ -154,10 +154,15 @@ EOF
     BASH_BIN="$(command -v bash)"; DD_BIN="$(command -v dd)"
     cp "$BASH_BIN" "$RAMBIN/bash"; cp "$DD_BIN" "$RAMBIN/dd"
     LOADER=""
+    BINDS=()
     for f in $( (ldd "$BASH_BIN"; ldd "$DD_BIN") | awk '$2=="=>" && $3 ~ /^\// {print $3} $1 ~ /^\// {print $1}' | sort -u); do
         cp -L "$f" "$RAMBIN/"
         case "$f" in */ld-linux*|*/ld64*|*/ld-*.so*) LOADER="$RAMBIN/$(basename "$f")" ;; esac
+        # put the RAM copy over the original path, so binaries started directly
+        # from RAM also load their loader/libraries from RAM, not from the disk
+        mount --bind "$RAMBIN/$(basename "$f")" "$f" 2>/dev/null && BINDS+=("$f") || true
     done
+    unbind() { for b in "${BINDS[@]}"; do umount "$b" 2>/dev/null || true; done; }
     [ -n "$LOADER" ] || die "could not find the dynamic loader"
     RUN=("$LOADER" --library-path "$RAMBIN")
 
@@ -166,6 +171,7 @@ EOF
     # by really copying a small file.
     head -c 1048576 /dev/urandom > "$WORK/t.in"
     CANDS=(
+        "$RAMBIN/dd"
         "${RUN[*]} --argv0 dd $RAMBIN/dd"
         "${RUN[*]} $RAMBIN/dd"
         "${RUN[*]} $RAMBIN/dd --coreutils-prog=dd"
@@ -188,6 +194,7 @@ EOF
     rm -f "$WORK/t.in" "$WORK/t.out"
     if [ -z "$DD_CMD" ]; then
         for c in "${CANDS[@]}"; do echo "--- $c" >&2; $c --version 2>&1 | head -n 2 >&2 || true; done
+        unbind
         die "cannot run dd from RAM (disk was NOT touched)"
     fi
     echo ">>> dd from RAM: OK"
