@@ -126,7 +126,7 @@ main() {
 /ip route add gateway=$GATEWAY
 /ip dns set servers=1.1.1.1,8.8.8.8
 /ip service disable telnet,ftp,api,api-ssl
-/user set 0 name=$CHR_USER password="$CHR_PASSWORD"
+/user set [find name=admin] name=$CHR_USER password="$CHR_PASSWORD"
 EOF
     umount "$MNT"
 
