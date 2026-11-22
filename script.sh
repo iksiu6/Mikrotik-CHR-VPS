@@ -91,15 +91,17 @@ main() {
 
     # --- 5. Download image (into RAM so dd doesn't read a file it overwrites)
     # The image MUST be in RAM: a file on the disk would be overwritten while dd reads it.
-    WORK=/dev/shm/chr
-    if [ ! -d /dev/shm ] || [ "$(df -Pm /dev/shm | awk 'NR==2{print $4}')" -lt 300 ]; then
-        mkdir -p /mnt/chr-ram && mount -t tmpfs -o size=320m tmpfs /mnt/chr-ram \
-            || die "cannot create RAM disk for the image"
-        WORK=/mnt/chr-ram/chr
-    fi
+    # Use our own tmpfs (/dev/shm is often mounted noexec, and we run programs from it).
     MEM_AVAIL="$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)"
     [ -z "$MEM_AVAIL" ] || [ "$MEM_AVAIL" -ge 300 ] \
         || die "not enough free RAM (${MEM_AVAIL} MB, need ~300 MB) - stop other services first"
+    rm -rf /dev/shm/chr 2>/dev/null || true          # leftovers from older script versions
+    RAMDIR=/mnt/chr-ram
+    mkdir -p "$RAMDIR"
+    if ! grep -qs " $RAMDIR tmpfs " /proc/mounts; then
+        mount -t tmpfs -o size=320m,mode=0700,exec tmpfs "$RAMDIR" || die "cannot create RAM disk $RAMDIR"
+    fi
+    WORK="$RAMDIR/chr"
     rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK"
 
     URL="https://download.mikrotik.com/routeros/$CHR_VERSION/chr-$CHR_VERSION.img.zip"
@@ -158,7 +160,11 @@ EOF
     done
     [ -n "$LOADER" ] || die "could not find the dynamic loader"
     RUN=("$LOADER" --library-path "$RAMBIN")
-    "${RUN[@]}" "$RAMBIN/dd" --version >/dev/null 2>&1 || die "cannot run dd from RAM"
+    if ! ERR="$("${RUN[@]}" "$RAMBIN/dd" --version 2>&1 >/dev/null)"; then
+        echo "$ERR" >&2
+        grep " $RAMDIR " /proc/mounts >&2 || true
+        die "cannot run dd from RAM (disk was NOT touched)"
+    fi
 
     swapoff -a 2>/dev/null || true      # RAM pages must not be swapped to the disk
     sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true   # free RAM before the last stage
