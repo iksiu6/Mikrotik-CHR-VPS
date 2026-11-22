@@ -136,15 +136,41 @@ EOF
     fi
 
     # --- 8. Write and reboot ----------------------------------------------
+    # While dd overwrites the disk, NOTHING may be loaded from that disk any
+    # more (on a small VPS the kernel evicts program pages and re-reads them
+    # from the now-overwritten disk -> segfault / "Bad message").
+    # So copy bash + dd + their libraries into RAM and run the last stage from there.
+    RAMBIN="$WORK/bin"; mkdir -p "$RAMBIN"
+    BASH_BIN="$(command -v bash)"; DD_BIN="$(command -v dd)"
+    cp "$BASH_BIN" "$RAMBIN/bash"; cp "$DD_BIN" "$RAMBIN/dd"
+    LOADER=""
+    for f in $( (ldd "$BASH_BIN"; ldd "$DD_BIN") | awk '$2=="=>" && $3 ~ /^\// {print $3} $1 ~ /^\// {print $1}' | sort -u); do
+        cp -L "$f" "$RAMBIN/"
+        case "$f" in */ld-linux*|*/ld64*|*/ld-*.so*) LOADER="$RAMBIN/$(basename "$f")" ;; esac
+    done
+    [ -n "$LOADER" ] || die "could not find the dynamic loader"
+    RUN=("$LOADER" --library-path "$RAMBIN")
+    "${RUN[@]}" "$RAMBIN/dd" --version >/dev/null 2>&1 || die "cannot run dd from RAM"
+
+    swapoff -a 2>/dev/null || true      # RAM pages must not be swapped to the disk
     echo 1 > /proc/sys/kernel/sysrq 2>/dev/null || true
     sync
-    echo u > /proc/sysrq-trigger          # remount filesystems read-only
-    dd if=chr.img of="$CHR_DISK" bs=4M conv=fsync 2>/dev/null || dd if=chr.img of="$CHR_DISK" bs=1024
-    echo ">>> Sync disk"
-    echo s > /proc/sysrq-trigger
-    sleep 5
-    echo ">>> Reboot"
-    echo b > /proc/sysrq-trigger
+
+    # Last stage: only builtins + dd from RAM. Reboots even if dd fails.
+    exec "${RUN[@]}" "$RAMBIN/bash" --norc --noprofile -c '
+        LD="$1"; BIN="$2"; IMG="$3"; DISK="$4"
+        echo u > /proc/sysrq-trigger                 # remount filesystems read-only
+        echo ">>> Writing image to $DISK ..."
+        if "$LD" --library-path "$BIN" "$BIN/dd" if="$IMG" of="$DISK" bs=1M conv=fsync; then
+            echo ">>> Image written"
+        else
+            echo "!!! dd failed - image may be incomplete"
+        fi
+        echo s > /proc/sysrq-trigger
+        t=$SECONDS; while [ $((SECONDS - t)) -lt 5 ]; do :; done
+        echo ">>> Reboot"
+        echo b > /proc/sysrq-trigger
+    ' _ "$LOADER" "$RAMBIN" "$WORK/chr.img" "$CHR_DISK"
 }
 
 main "$@"
