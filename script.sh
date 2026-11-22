@@ -31,7 +31,7 @@ main() {
     die() { echo "ERROR: $*" >&2; exit 1; }
 
     [ "$(id -u)" -eq 0 ] || die "run as root (sudo bash)"
-    for c in ip awk dd mount umount lsblk; do
+    for c in ip awk dd mount umount lsblk ldd; do
         command -v "$c" >/dev/null 2>&1 || die "missing command: $c"
     done
     command -v unzip >/dev/null 2>&1 || command -v gunzip >/dev/null 2>&1 || die "unzip or gunzip is required"
@@ -160,11 +160,37 @@ EOF
     done
     [ -n "$LOADER" ] || die "could not find the dynamic loader"
     RUN=("$LOADER" --library-path "$RAMBIN")
-    if ! ERR="$("${RUN[@]}" "$RAMBIN/dd" --version 2>&1 >/dev/null)"; then
-        echo "$ERR" >&2
-        grep " $RAMDIR " /proc/mounts >&2 || true
+
+    # dd may be a multi-call binary (coreutils single-binary / uutils) that picks
+    # its function from argv[0] - try several ways to run it and test each one
+    # by really copying a small file.
+    head -c 1048576 /dev/urandom > "$WORK/t.in"
+    CANDS=(
+        "${RUN[*]} --argv0 dd $RAMBIN/dd"
+        "${RUN[*]} $RAMBIN/dd"
+        "${RUN[*]} $RAMBIN/dd --coreutils-prog=dd"
+        "${RUN[*]} $RAMBIN/dd dd"
+    )
+    BB="$(command -v busybox 2>/dev/null || true)"
+    if [ -n "$BB" ] && ! ldd "$BB" >/dev/null 2>&1; then   # static busybox needs no libraries
+        cp "$BB" "$RAMBIN/busybox"; CANDS+=("$RAMBIN/busybox dd")
+    fi
+    DD_CMD=""
+    for c in "${CANDS[@]}"; do
+        rm -f "$WORK/t.out"
+        # shellcheck disable=SC2086
+        if $c if="$WORK/t.in" of="$WORK/t.out" bs=1M conv=fsync >/dev/null 2>&1 \
+           && [ "$(wc -c < "$WORK/t.out" 2>/dev/null)" = 1048576 ] \
+           && { ! command -v cmp >/dev/null 2>&1 || cmp -s "$WORK/t.in" "$WORK/t.out"; }; then
+            DD_CMD="$c"; break
+        fi
+    done
+    rm -f "$WORK/t.in" "$WORK/t.out"
+    if [ -z "$DD_CMD" ]; then
+        for c in "${CANDS[@]}"; do echo "--- $c" >&2; $c --version 2>&1 | head -n 2 >&2 || true; done
         die "cannot run dd from RAM (disk was NOT touched)"
     fi
+    echo ">>> dd from RAM: OK"
 
     swapoff -a 2>/dev/null || true      # RAM pages must not be swapped to the disk
     sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true   # free RAM before the last stage
@@ -173,10 +199,10 @@ EOF
 
     # Last stage: only builtins + dd from RAM. Reboots even if dd fails.
     exec "${RUN[@]}" "$RAMBIN/bash" --norc --noprofile -c '
-        LD="$1"; BIN="$2"; IMG="$3"; DISK="$4"
+        IMG="$1"; DISK="$2"; DD="$3"
         echo u > /proc/sysrq-trigger                 # remount filesystems read-only
         echo ">>> Writing image to $DISK ..."
-        if "$LD" --library-path "$BIN" "$BIN/dd" if="$IMG" of="$DISK" bs=1M conv=fsync; then
+        if $DD if="$IMG" of="$DISK" bs=1M conv=fsync; then
             echo ">>> Image written"
         else
             echo "!!! dd failed - image may be incomplete"
@@ -185,7 +211,7 @@ EOF
         t=$SECONDS; while [ $((SECONDS - t)) -lt 5 ]; do :; done
         echo ">>> Reboot"
         echo b > /proc/sysrq-trigger
-    ' _ "$LOADER" "$RAMBIN" "$WORK/chr.img" "$CHR_DISK"
+    ' _ "$WORK/chr.img" "$CHR_DISK" "$DD_CMD"
 }
 
 main "$@"
